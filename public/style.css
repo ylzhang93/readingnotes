@@ -117,6 +117,18 @@ input[type="text"]:focus { outline: none; border-color: var(--accent); }
 .nb-item .nb-actions button { padding: 4px 9px; font-size: 12px; }
 .nb-empty { color: var(--muted); text-align: center; padding: 30px 0; }
 
+.api-card { margin-top: 16px; }
+.api-row { display: flex; gap: 8px; align-items: center; }
+#api-provider {
+  background: var(--card); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font-size: 13px;
+}
+.api-row input[type="password"] {
+  flex: 1; background: #12171d; color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; font-size: 13px;
+}
+.api-row input[type="password"]:focus { outline: none; border-color: var(--accent); }
+
 /* ---------------- notebook view ---------------- */
 #main { display: flex; height: calc(100vh - 52px); }
 #notebook-view { display: flex; flex: 1; min-width: 0; }

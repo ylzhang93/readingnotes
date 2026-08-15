@@ -42,12 +42,6 @@ function loadConfig() {
         credentialsFile: process.env.DEEPSEEK_CREDENTIALS_FILE ||
           'C:\\Users\\49654\\.dsh\\.credentials.yaml',
         maxOutputTokens: 8000
-      },
-      cstcloud: {
-        baseURL: 'https://uni-api.cstcloud.cn/v1',
-        model: 'deepseek-v4-flash',
-        apiKey: '',
-        maxOutputTokens: 8000
       }
     }
   };
@@ -104,6 +98,23 @@ function readApiKey() {
     if (m) return m[1].trim();
   }
   return null;
+}
+
+/* Effective key for a provider (apiKey first, then credentialsFile). */
+function providerKey(pr) {
+  if (pr.apiKey) return String(pr.apiKey).trim();
+  if (pr.credentialsFile && fs.existsSync(pr.credentialsFile)) {
+    try {
+      const txt = fs.readFileSync(pr.credentialsFile, 'utf8');
+      const m = txt.match(/^\s*DEEPSEEK_API_KEY\s*:\s*["']?([^"'\r\n]+)["']?\s*$/m);
+      if (m) return m[1].trim();
+    } catch (_) {}
+  }
+  return '';
+}
+function maskKey(k) {
+  if (!k) return '';
+  return k.length > 8 ? k.slice(0, 4) + '…' + k.slice(-4) : '••••';
 }
 
 /* ------------------------------------------------------------ tex utils -- */
@@ -564,10 +575,29 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/providers' && req.method === 'GET') {
-      const list = Object.keys(config.providers).map((name) => ({
-        name, model: config.providers[name].model, baseURL: config.providers[name].baseURL
-      }));
+      const list = Object.keys(config.providers).map((name) => {
+        const pr = config.providers[name];
+        const k = providerKey(pr);
+        return {
+          name, model: pr.model, baseURL: pr.baseURL,
+          hasKey: !!k,
+          maskedKey: maskKey(k),
+          source: pr.apiKey ? 'apiKey' : (pr.credentialsFile ? 'credentialsFile' : '')
+        };
+      });
       return sendJSON(res, 200, { active: activeProviderName(), list });
+    }
+
+    if (p === '/api/set-apikey' && req.method === 'POST') {
+      const b = await readBody(req);
+      const name = String(b.provider || '').trim();
+      const key = String(b.apiKey || '').trim();
+      if (!config.providers[name]) return sendJSON(res, 400, { error: 'unknown provider: ' + name });
+      if (!key) return sendJSON(res, 400, { error: 'apiKey is empty' });
+      config.providers[name].apiKey = key;
+      saveConfig();
+      const masked = key.length > 8 ? key.slice(0, 4) + '…' + key.slice(-4) : '••••';
+      return sendJSON(res, 200, { ok: true, provider: name, maskedKey: masked });
     }
 
     if (p === '/api/switch-provider' && req.method === 'POST') {

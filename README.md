@@ -43,7 +43,7 @@ node server.js
 4. 自动：生成解释 → 写入 `readingnote` → `latexmk` 重编译 → PDF 刷新。
 
 弹框内可开关：
-- `🧠 thinking`：是否先推理（cstcloud 对长提示词会超时，建议关闭；deepseek 官方可用）。
+- `🧠 thinking`：是否先推理（推理模型对长提示词可能较慢/超时，必要时可关闭）。
 - `✍️ write .tex`：关闭则只存笔记本、不写 tex、不编译。
 
 ## 配置说明（config.json）
@@ -70,7 +70,7 @@ node server.js
 }
 ```
 
-- `cstcloud` 这类 provider 按同样结构加进 `providers` 即可，网页右上角下拉框会自动出现。
+- 其它 OpenAI 兼容 provider 按同样结构加进 `providers` 即可，网页右上角下拉框会自动出现。
 - 切换 provider：网页下拉框，或改 `activeProvider` 后重启。
 
 ## 目录结构

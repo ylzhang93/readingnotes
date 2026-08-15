@@ -68,9 +68,12 @@ function showNotebookView(st) {
   renderPdf();
 }
 
+let providersCache = [];
 async function populateProviders() {
   try {
     const r = await (await fetch('/api/providers')).json();
+    providersCache = r.list;
+    // topbar provider switcher
     const sel = $('provider-select');
     sel.innerHTML = '';
     for (const p of r.list) {
@@ -80,7 +83,51 @@ async function populateProviders() {
       sel.appendChild(o);
     }
     sel.value = r.active;
+    // notebooks-view api-key editor
+    const asel = $('api-provider');
+    asel.innerHTML = '';
+    for (const p of r.list) {
+      const o = document.createElement('option');
+      o.value = p.name;
+      o.textContent = p.name;
+      asel.appendChild(o);
+    }
+    asel.value = r.active;
+    updateApiKeyHint(r.active);
   } catch (_) { /* ignore */ }
+}
+function updateApiKeyHint(name) {
+  const p = providersCache.find((x) => x.name === name);
+  const inp = $('api-key');
+  inp.value = '';
+  if (p && p.hasKey) {
+    const src = p.source === 'credentialsFile' ? ' (from credentialsFile)' : '';
+    inp.placeholder = 'current: ' + p.maskedKey + src + ' (type to replace)';
+  } else {
+    inp.placeholder = 'Paste a new API key…';
+  }
+}
+async function saveApiKey() {
+  const name = $('api-provider').value;
+  const key = $('api-key').value.trim();
+  const st = $('api-status');
+  if (!key) { st.textContent = 'paste a key first'; st.className = 'status err'; return; }
+  st.textContent = 'saving…'; st.className = 'status';
+  try {
+    const res = await fetch('/api/set-apikey', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: name, apiKey: key })
+    });
+    const r = await res.json();
+    if (!res.ok) throw new Error(r.error || ('HTTP ' + res.status));
+    st.textContent = `saved for ${name} (${r.maskedKey})`;
+    st.className = 'status ok';
+    $('api-key').value = '';
+    populateProviders();
+  } catch (e) {
+    st.textContent = String(e.message || e);
+    st.className = 'status err';
+  }
 }
 async function switchProvider(name) {
   try {
@@ -484,6 +531,8 @@ $('btn-panel').addEventListener('click', () => {
 });
 $('btn-notebooks').addEventListener('click', toggleNotebooks);
 $('provider-select').addEventListener('change', (e) => switchProvider(e.target.value));
+$('api-provider').addEventListener('change', (e) => updateApiKeyHint(e.target.value));
+$('api-save').addEventListener('click', saveApiKey);
 $('btn-open-folder').addEventListener('click', () => {
   const dir = $('folder-path').value.trim();
   $('open-error').textContent = '';
