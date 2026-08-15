@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# secrets & local state (never commit)
+config.json
+notebooks.json
+
+# notebook state that lives inside document folders
+.texnote/
+
+# logs & scratch
+*.log
+*.aux
+*.out
+*.synctex*
+*.fdb_latexmk
+*.fls
+_test*/
+_cleanup*.js
+_testreg*.json

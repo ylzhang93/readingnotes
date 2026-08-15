@@ -1,0 +1,97 @@
+% ==============================================================================
+%  readingnote.sty — robust reading-note box for study annotations
+%
+%  Usage:
+%    \usepackage{readingnote}            % in the preamble
+%
+%    \begin{readingnote}[Q1]{Short question title}   % [id] is optional
+%      ... explanation body (any LaTeX: lists, display math, ...) ...
+%    \end{readingnote}
+%
+%  Display switches (anywhere in the body):
+%    \noteson               show all notes (the default)
+%    \notesoff              hide all notes
+%    \shownotes{Q3,Q7}      show only the notes with the listed [id]
+%
+%  Robustness notes (vs. the old inline tcolorbox hack):
+%    * The title is typeset as an ordinary bold paragraph — it WRAPS naturally,
+%      handles long questions and inline math, and never uses \resizebox or
+%      tcolorbox's fragile title machinery.
+%    * The [id] matching uses expl3 (no \forcsvlist / \ifstrequal pitfalls).
+%    * The body is collected with environ's \NewEnviron, which correctly
+%      collects the body even when the environment sits inside an
+%      \input/\include sub-file (xparse's +b overflows "text input levels").
+% ==============================================================================
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{readingnote}[2026/08/15 v1 reading-note box]
+
+\RequirePackage{xcolor}
+\RequirePackage{xparse}
+\RequirePackage{environ}
+\RequirePackage{tcolorbox}
+\tcbuselibrary{breakable, skins}
+
+% ----------------------------------------------------------------------------
+% Display switches (expl3)
+% ----------------------------------------------------------------------------
+\ExplSyntaxOn
+\bool_new:N \g__rn_all_bool
+\bool_new:N \g__rn_some_bool
+\seq_new:N  \g__rn_shown_seq
+
+\NewDocumentCommand \noteson {} {
+  \bool_gset_true:N  \g__rn_all_bool
+  \bool_gset_false:N \g__rn_some_bool
+}
+\NewDocumentCommand \notesoff {} {
+  \bool_gset_false:N \g__rn_all_bool
+  \bool_gset_false:N \g__rn_some_bool
+}
+\NewDocumentCommand \shownotes { m } {
+  \bool_gset_false:N \g__rn_all_bool
+  \bool_gset_true:N  \g__rn_some_bool
+  \seq_gset_from_clist:Nn \g__rn_shown_seq {#1}
+}
+
+\prg_new_conditional:Npnn \rn_if_shown:n #1 { T, F, TF } {
+  \bool_if:NTF \g__rn_all_bool
+    { \prg_return_true: }
+    {
+      \bool_if:NTF \g__rn_some_bool
+        { \seq_if_in:NnTF \g__rn_shown_seq {#1} { \prg_return_true: } { \prg_return_false: } }
+        { \prg_return_false: }
+    }
+}
+
+% default: show everything
+\bool_gset_true:N \g__rn_all_bool
+\ExplSyntaxOff
+
+% ----------------------------------------------------------------------------
+% The box (defined OUTSIDE \ExplSyntaxOn so pgfkeys keys with spaces work)
+% ----------------------------------------------------------------------------
+\newtcolorbox{rnbox}{%
+  breakable, enhanced,
+  colback=blue!4!white, colframe=blue!45!black,
+  boxrule=0.7pt, arc=1.5mm,
+  left=7pt, right=7pt, top=6pt, bottom=6pt,
+  before upper={\setlength{\emergencystretch}{2em}}
+}
+
+% ----------------------------------------------------------------------------
+% The environment: readingnote[id]{title}
+% (defined inside \ExplSyntaxOn so the :/_ in \rn_if_shown:nTF tokenise right)
+% ----------------------------------------------------------------------------
+\ExplSyntaxOn
+\NewEnviron{readingnote}[2][]{%
+  \rn_if_shown:nTF {#1} {%
+    \begin{rnbox}%
+      {\bfseries\sffamily\color{blue!50!black}#2\par}%
+      \smallskip
+      \BODY
+    \end{rnbox}%
+  }{}%
+}
+\ExplSyntaxOff
+
+\endinput

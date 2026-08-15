@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>texnote-reader</title>
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">📖 <b>texnote-reader</b> <span id="docname" class="muted"></span></div>
+  <div id="pagenav" class="pagenav" hidden>
+    <button id="btn-fit-page" title="Fit the whole page">⤢</button>
+    <button id="btn-fit-width" title="Fit to page width">↔</button>
+    <button id="btn-fullscreen" title="Toggle fullscreen">⛶</button>
+    <span class="sep"></span>
+    <button id="btn-prev" title="Previous page">◀</button>
+    <input id="page-input" type="text" inputmode="numeric" value="1">
+    <span id="page-total" class="muted">/ 1</span>
+    <button id="btn-next" title="Next page">▶</button>
+    <span class="sep"></span>
+    <button id="btn-zoom-out" title="Zoom out">−</button>
+    <button id="btn-zoom-in" title="Zoom in">＋</button>
+  </div>
+  <div class="controls">
+    <div class="controls" id="top-controls" hidden>
+      <select id="provider-select" title="LLM provider"></select>
+      <span class="chip">next: <span id="nextq">…</span></span>
+      <button id="btn-compile" title="Recompile the PDF">🔄 Recompile</button>
+      <button id="btn-panel" title="Toggle the side panel">☰ Panel</button>
+    </div>
+    <button id="btn-notebooks" title="Toggle the notebook list">📚 Notebooks</button>
+  </div>
+</header>
+
+<div id="main">
+  <!-- ================= Notebook manager ================= -->
+  <div id="notebooks-view" class="nb-view" hidden>
+    <div class="nb-hero">
+      <h1>Notebooks</h1>
+      <p>Each document folder is one notebook. Notes persist in <code>.texnote/notebook.json</code> inside the folder,
+         so memory follows the folder and every follow-up question hits the DeepSeek cache.</p>
+      <div class="open-row">
+        <input id="folder-path" placeholder="Paste a folder path, e.g. C:\Users\you\Documents\paper">
+        <button id="btn-open-folder" class="primary">Open folder</button>
+      </div>
+      <div id="open-error" class="status err"></div>
+    </div>
+    <div id="notebook-list" class="nb-list"></div>
+  </div>
+
+  <!-- ================= Notebook (PDF + toolbar + panel) ================= -->
+  <div id="notebook-view" hidden>
+    <div id="viewer-wrap">
+      <div id="viewer"></div>
+    </div>
+
+    <aside id="panel">
+      <section class="card">
+        <div class="card-title">History <span class="hint">(click to view / jump)</span></div>
+        <div id="history" class="history"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Note preview</div>
+        <div id="note-preview" class="preview" style="max-height:300px">—</div>
+      </section>
+
+      <section class="card" id="reasoning-card" hidden>
+        <details>
+          <summary>🧠 Reasoning (last)</summary>
+          <pre id="reasoning" class="reasoning"></pre>
+        </details>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Compile log</div>
+        <pre id="log" class="log">—</pre>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<!-- one-shot annotation popover -->
+<div id="popover" hidden>
+  <div class="pop-selected" id="pop-selected"></div>
+  <div class="pop-row">
+    <input id="pop-question" type="text" placeholder="Ask a question… (Enter to submit)">
+    <button id="pop-submit" class="primary" title="Explain & insert">→</button>
+  </div>
+  <div class="pop-toggles">
+    <label class="toggle" title="Reasoning (chain-of-thought) for this note">
+      <input type="checkbox" id="pop-thinking"><span>🧠 thinking</span>
+    </label>
+    <label class="toggle" title="Write this note into the .tex (off = notebook only)">
+      <input type="checkbox" id="pop-write" checked><span>✍️ write .tex</span>
+    </label>
+  </div>
+  <div id="pop-status" class="status"></div>
+</div>
+
+<div id="toast" hidden></div>
+
+<script src="/vendor/pdf.min.js"></script>
+<script src="/vendor/katex/katex.min.js"></script>
+<script src="/texrender.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
