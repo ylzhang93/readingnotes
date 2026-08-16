@@ -1,6 +1,7 @@
 {
   "port": 8910,
   "activeProvider": "deepseek",
+  "winedtPath": "",
   "providers": {
     "deepseek": {
       "baseURL": "https://api.deepseek.com",

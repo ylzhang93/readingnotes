@@ -19,6 +19,7 @@ const notePreview = $('note-preview');
 const historyEl = $('history');
 const logEl = $('log');
 const toastEl = $('toast');
+const ctxMenu = $('ctx-menu');
 
 let pdf = null;
 let pages = [];
@@ -30,6 +31,9 @@ let pageWidthPt = 0;
 let pageHeightPt = 0;
 let suppressScroll = false;
 let fullscreenPos = null;
+let pageObserver = null;
+let currentNoteId = null;   // the note currently loaded in the preview
+let regenerated = null;     // { title, explanation } awaiting save
 
 /* --------------------------------------------------------------- views -- */
 function showNotebooks() {
@@ -64,6 +68,7 @@ function showNotebookView(st) {
   if (localStorage.getItem('texnote-panel-collapsed') === '1') $('panel').classList.add('collapsed');
   else $('panel').classList.remove('collapsed');
   renderHistory(st.entries);
+  loadNotesDisplay();
   currentPage = 1;   // each newly-opened notebook starts at page 1
   renderPdf();
 }
@@ -82,7 +87,11 @@ async function populateProviders() {
       o.textContent = p.name + ' (' + p.model + ')';
       sel.appendChild(o);
     }
-    sel.value = r.active;
+    // prefer the browser-remembered provider; fall back to the server's active
+    const remembered = localStorage.getItem('texnote-provider');
+    sel.value = (remembered && r.list.some((p) => p.name === remembered)) ? remembered : r.active;
+    // keep localStorage in sync with the server default when nothing was remembered
+    if (!remembered) localStorage.setItem('texnote-provider', r.active);
     // notebooks-view api-key editor
     const asel = $('api-provider');
     asel.innerHTML = '';
@@ -135,6 +144,7 @@ async function switchProvider(name) {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ provider: name })
     })).json();
+    localStorage.setItem('texnote-provider', r.active);
     toast('provider → ' + r.active, 'ok');
   } catch (e) {
     toast(String(e.message || e), 'err');
@@ -226,8 +236,23 @@ function restorePos(pos) {
   $('page-input').value = pos.page;
 }
 
+// Persist the view position so an accidental page reload (or re-render) never
+// dumps the reader back to page 1. Keyed per document so notebooks don't clash.
+function posKey() { return 'texnote-pos:' + (state ? state.texFile : ''); }
+function readPersistedPos() {
+  try {
+    const raw = sessionStorage.getItem(posKey());
+    if (!raw) return null;
+    const pos = JSON.parse(raw);
+    return (pos && typeof pos.page === 'number' && pos.page >= 1) ? pos : null;
+  } catch (_) { return null; }
+}
+function persistPos() {
+  try { sessionStorage.setItem(posKey(), JSON.stringify(capturePos())); } catch (_) {}
+}
+
 async function renderPdf(keepPos) {
-  const pos = keepPos ? capturePos() : null;
+  const pos = keepPos ? capturePos() : readPersistedPos();
   suppressScroll = true;
   viewer.innerHTML = '';
   pages = [];
@@ -258,14 +283,18 @@ async function renderPdf(keepPos) {
   if (pos) restorePos(pos);
   else { currentPage = 1; $('page-input').value = 1; viewerWrap.scrollTop = 0; }
 
-  // render content: target page first, then outward
-  const target = pos ? pos.page : 1;
-  const order = [target];
-  for (let d = 1; d < n; d++) {
-    if (target - d >= 1) order.push(target - d);
-    if (target + d <= n) order.push(target + d);
-  }
-  for (const i of order) await renderPageContent(i);
+  // lazy rendering: observe each placeholder and render it only when it nears the viewport
+  if (pageObserver) { pageObserver.disconnect(); pageObserver = null; }
+  pageObserver = new IntersectionObserver((entries) => {
+    for (const en of entries) {
+      if (en.isIntersecting) {
+        const i = parseInt(en.target.dataset.page, 10);
+        renderPageContent(i);
+        pageObserver.unobserve(en.target);
+      }
+    }
+  }, { root: viewerWrap, rootMargin: '600px 0px' });
+  for (const p of pages) pageObserver.observe(p.wrapper);
 
   suppressScroll = false;
   setStatus('pop-status', '', '');
@@ -343,6 +372,7 @@ function updatePageIndicator() {
     if (overlap > bestOverlap) { bestOverlap = overlap; best = p.pageNumber; }
   }
   if (best !== currentPage) { currentPage = best; $('page-input').value = best; }
+  persistPos();
 }
 
 /* ------------------------------------------------------------ selection -- */
@@ -373,6 +403,7 @@ function showPopover(info) {
   popStatus.textContent = '';
   $('pop-thinking').checked = localStorage.getItem('texnote-pop-thinking') === '1';
   $('pop-write').checked = localStorage.getItem('texnote-pop-write') !== '0';
+  $('pop-lang').value = localStorage.getItem('texnote-lang') === 'zh' ? 'zh' : 'en';
   popover.hidden = false;
   // position below the selection (clamped to viewport)
   const w = 420;
@@ -390,6 +421,62 @@ function onSelectionEnd() {
   if (!info) return;
   currentSelection = info;
   showPopover(info);
+}
+
+/* ------------------------------------------------------- reverse search -- */
+let ctxPoint = null;
+
+// Convert a pointer event to a PDF coordinate (page + bp from top-left).
+function pdfPointFromEvent(e) {
+  for (const p of pages) {
+    const pr = p.wrapper.getBoundingClientRect();
+    if (e.clientX < pr.left || e.clientX > pr.right || e.clientY < pr.top || e.clientY > pr.bottom) continue;
+    const cssX = e.clientX - pr.left;
+    const cssY = e.clientY - pr.top;
+    if (p.viewport) {
+      const [pdfX, pdfY] = p.viewport.convertToPdfPoint(cssX, cssY);
+      return { page: p.pageNumber, x: pdfX.toFixed(3), y: (p.pdfHeight - pdfY).toFixed(3) };
+    }
+    // placeholder page not yet rendered: uniform-scale fallback
+    if (currentScale > 0) {
+      return { page: p.pageNumber, x: (cssX / currentScale).toFixed(3), y: (cssY / currentScale).toFixed(3) };
+    }
+  }
+  return null;
+}
+
+function showCtxMenu(e) {
+  if (!viewerWrap.contains(e.target)) return;   // outside the PDF: keep the browser menu
+  e.preventDefault();                            // inside the PDF: always suppress Chrome's menu
+  ctxPoint = pdfPointFromEvent(e);
+  $('ctx-jump').classList.toggle('disabled', !ctxPoint);
+  ctxMenu.hidden = false;
+  const w = ctxMenu.offsetWidth || 220;
+  const h = ctxMenu.offsetHeight || 40;
+  ctxMenu.style.left = Math.min(e.clientX, window.innerWidth - w - 8) + 'px';
+  ctxMenu.style.top = Math.min(e.clientY, window.innerHeight - h - 8) + 'px';
+}
+function hideCtxMenu() { ctxMenu.hidden = true; ctxPoint = null; }
+
+async function doCtxJump() {
+  if (!ctxPoint) { toast('此处无法定位到源码', 'err'); hideCtxMenu(); return; }
+  const pt = ctxPoint;
+  hideCtxMenu();
+  try {
+    const res = await fetch('/api/synctex-jump', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ page: pt.page, x: pt.x, y: pt.y })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    toast(`→ WinEdt  ${pathBase(data.file)}  L${data.line}`, 'ok');
+  } catch (e) {
+    toast('反向搜索失败: ' + String(e.message || e), 'err');
+  }
+}
+function pathBase(p) {
+  const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+  return i >= 0 ? p.slice(i + 1) : p;
 }
 
 /* -------------------------------------------------------------- status -- */
@@ -419,6 +506,8 @@ async function submitAnnotation() {
   if (!question) { setStatus('pop-status', 'type a question first', 'err'); return; }
   const thinking = $('pop-thinking').checked;
   const writeToTex = $('pop-write').checked;
+  const lang = $('pop-lang').value === 'zh' ? 'zh' : 'en';
+  localStorage.setItem('texnote-lang', lang);
   $('pop-submit').disabled = true;
   setStatus('pop-status', thinking ? 'thinking…' : 'generating…', '');
   try {
@@ -427,7 +516,7 @@ async function submitAnnotation() {
       body: JSON.stringify({
         question, selectedText: currentSelection.text,
         page: currentSelection.page, x: currentSelection.x, y: currentSelection.y,
-        thinking, writeToTex
+        thinking, writeToTex, lang
       })
     });
     const data = await res.json();
@@ -464,11 +553,136 @@ function renderHistory(entries) {
     item.innerHTML = '<span class="hid">' + escapeHtml(e.id) + '</span>' + escapeHtml(e.title) + badge +
       (e.line ? '<span class="hline">L' + escapeHtml(e.line) + '</span>' : '');
     item.title = e.inTex && e.page ? 'Jump to page ' + e.page : 'View this note';
-    item.onclick = () => {
-      notePreview.innerHTML = window.texToHtml('\\textbf{' + (e.title || '') + '}\n\n' + (e.body || ''));
-      if (e.inTex && e.page) goToPage(e.page, true);
-    };
+    item.onclick = () => loadEntry(e);
     historyEl.appendChild(item);
+  }
+}
+
+function loadEntry(e) {
+  currentNoteId = e.id;
+  regenerated = null;
+  notePreview.innerHTML = window.texToHtml('\\textbf{' + (e.title || '') + '}\n\n' + (e.body || ''));
+  $('regen-thinking').checked = localStorage.getItem('texnote-pop-thinking') === '1';
+  $('regen-write').checked = e.inTex !== false;
+  $('regen-lang').value = localStorage.getItem('texnote-lang') === 'zh' ? 'zh' : 'en';
+  $('note-actions').hidden = false;
+  $('note-save-actions').hidden = true;
+  setStatus('regen-status', '', '');
+  if (e.inTex && e.page) goToPage(e.page, true);
+}
+
+async function doRegenerate() {
+  if (!currentNoteId) return;
+  const thinking = $('regen-thinking').checked;
+  const lang = $('regen-lang').value === 'zh' ? 'zh' : 'en';
+  localStorage.setItem('texnote-lang', lang);
+  setStatus('regen-status', 'regenerating…', '');
+  $('btn-regen').disabled = true;
+  try {
+    const res = await fetch('/api/reanswer', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: currentNoteId, thinking, lang })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    regenerated = { title: data.title, explanation: data.explanation };
+    notePreview.innerHTML = window.texToHtml('\\textbf{' + data.title + '}\n\n' + data.explanation);
+    if (data.reasoning) { reasoningEl.textContent = data.reasoning; reasoningCard.hidden = false; }
+    $('note-actions').hidden = true;
+    $('note-save-actions').hidden = false;
+    setStatus('regen-status', 'new answer ready — save or discard', 'ok');
+  } catch (e) {
+    setStatus('regen-status', String(e.message || e), 'err');
+  } finally {
+    $('btn-regen').disabled = false;
+  }
+}
+
+async function doSaveNote() {
+  if (!currentNoteId || !regenerated) return;
+  const writeToTex = $('regen-write').checked;
+  const lang = $('regen-lang').value === 'zh' ? 'zh' : 'en';
+  setStatus('regen-status', writeToTex ? 'saving + compiling…' : 'saving to notebook…', '');
+  try {
+    const res = await fetch('/api/update-note', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: currentNoteId, title: regenerated.title, explanation: regenerated.explanation, writeToTex, lang })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    log(data.logTail || '');
+    setStatus('regen-status', 'saved' + (data.recompiled ? ' & recompiled ✓' : ''), 'ok');
+    regenerated = null;
+    $('note-save-actions').hidden = true;
+    $('note-actions').hidden = false;
+    const st = await (await fetch('/api/state')).json();
+    renderHistory(st.entries);
+    if (data.recompiled) await renderPdf(true);
+  } catch (e) {
+    setStatus('regen-status', String(e.message || e), 'err');
+  }
+}
+
+function doDiscardNote() {
+  regenerated = null;
+  const st = state;
+  if (st) {
+    const e = st.entries.find((x) => x.id === currentNoteId);
+    if (e) {
+      notePreview.innerHTML = window.texToHtml('\\textbf{' + (e.title || '') + '}\n\n' + (e.body || ''));
+    }
+  }
+  $('note-save-actions').hidden = true;
+  $('note-actions').hidden = false;
+  setStatus('regen-status', 'discarded', '');
+}
+
+/* -------------------------------------------------------- notes display -- */
+async function loadNotesDisplay() {
+  try {
+    const d = await (await fetch('/api/notes-display')).json();
+    document.querySelectorAll('input[name="nd"]').forEach((r) => { r.checked = r.value === d.mode; });
+    $('nd-ids').hidden = d.mode !== 'some';
+    renderNdIds(d.allIds || [], d.ids || []);
+  } catch (_) { /* ignore */ }
+}
+function renderNdIds(allIds, selectedIds) {
+  const box = $('nd-ids');
+  box.innerHTML = '';
+  const sel = new Set(selectedIds || []);
+  for (const id of allIds) {
+    const label = document.createElement('label');
+    label.className = 'nd-id';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = id;
+    cb.checked = sel.has(id);
+    cb.addEventListener('change', () => applyNotesDisplay('some', selectedIdsFromBox()));
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(' ' + id));
+    box.appendChild(label);
+  }
+}
+function selectedIdsFromBox() {
+  return [...document.querySelectorAll('#nd-ids input:checked')].map((c) => c.value);
+}
+async function applyNotesDisplay(mode, ids) {
+  const st = $('nd-status');
+  st.textContent = 'compiling…'; st.className = 'status';
+  try {
+    const res = await fetch('/api/notes-display', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode, ids })
+    });
+    const r = await res.json();
+    if (!res.ok) throw new Error(r.error || ('HTTP ' + res.status));
+    log(r.logTail || '');
+    st.textContent = r.ok ? 'applied ✓' : 'compile failed — see log';
+    st.className = 'status ' + (r.ok ? 'ok' : 'err');
+    await renderPdf(true);
+  } catch (e) {
+    st.textContent = String(e.message || e);
+    st.className = 'status err';
   }
 }
 
@@ -493,14 +707,17 @@ async function doCompile() {
 document.addEventListener('mouseup', () => setTimeout(onSelectionEnd, 10));
 document.addEventListener('mousedown', (e) => {
   if (!popover.hidden && e.target && !popover.contains(e.target)) hidePopover();
+  if (!ctxMenu.hidden && e.target && !ctxMenu.contains(e.target)) hideCtxMenu();
 });
+document.addEventListener('contextmenu', showCtxMenu);
+$('ctx-jump').addEventListener('click', doCtxJump);
 document.addEventListener('wheel', (e) => {
   if (!popover.hidden && e.target && !popover.contains(e.target)) hidePopover();
 }, { passive: true });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !popover.hidden) hidePopover();
+  if (e.key === 'Escape') { if (!popover.hidden) hidePopover(); if (!ctxMenu.hidden) hideCtxMenu(); }
 });
-document.addEventListener('scroll', () => { if (!suppressScroll) updatePageIndicator(); }, true);
+document.addEventListener('scroll', () => { if (!suppressScroll) updatePageIndicator(); if (!ctxMenu.hidden) hideCtxMenu(); }, true);
 document.addEventListener('keydown', (e) => {
   if (e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
   if (e.key === 'PageDown' || e.key === 'ArrowRight') { e.preventDefault(); goToPage(currentPage + 1, true); }
@@ -533,6 +750,17 @@ $('btn-notebooks').addEventListener('click', toggleNotebooks);
 $('provider-select').addEventListener('change', (e) => switchProvider(e.target.value));
 $('api-provider').addEventListener('change', (e) => updateApiKeyHint(e.target.value));
 $('api-save').addEventListener('click', saveApiKey);
+$('btn-regen').addEventListener('click', doRegenerate);
+$('btn-save-note').addEventListener('click', doSaveNote);
+$('btn-discard-note').addEventListener('click', doDiscardNote);
+document.querySelectorAll('input[name="nd"]').forEach((r) => {
+  r.addEventListener('change', () => {
+    const mode = document.querySelector('input[name="nd"]:checked').value;
+    $('nd-ids').hidden = mode !== 'some';
+    if (mode === 'some') applyNotesDisplay('some', selectedIdsFromBox());
+    else applyNotesDisplay(mode, []);
+  });
+});
 $('btn-open-folder').addEventListener('click', () => {
   const dir = $('folder-path').value.trim();
   $('open-error').textContent = '';

@@ -63,6 +63,11 @@ html, body {
 
 .toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
 .toggle input { accent-color: var(--accent); }
+.toggle select {
+  background: var(--card); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 2px 6px; font-size: 12px; cursor: pointer;
+}
+.toggle select:focus { outline: none; border-color: var(--accent); }
 
 button {
   background: var(--card);
@@ -253,6 +258,29 @@ button.mini {
 .badge.tex { background: #153a24; color: #6fe3a0; border: 1px solid #2f7a4f; }
 .badge.nb  { background: #2a2438; color: #c4a6ff; border: 1px solid #5b4b8a; }
 
+/* ---------------- notes display switch ---------------- */
+.nd-modes {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  padding: 6px; border: 1px solid var(--border); border-radius: 10px;
+  background: #12171d; margin-bottom: 8px;
+}
+.nd-mode {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px; border-radius: 7px; cursor: pointer;
+  font-size: 12.5px; color: var(--muted);
+}
+.nd-mode:hover { background: var(--card); }
+.nd-mode input { accent-color: var(--accent); margin: 0; }
+.nd-mode input:checked + span { color: var(--text); font-weight: 600; }
+.nd-ids { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.nd-id {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border: 1px solid var(--border); border-radius: 999px;
+  font-size: 11.5px; color: var(--text); cursor: pointer; background: #12171d;
+}
+.nd-id:hover { border-color: var(--accent); }
+.nd-id input { accent-color: var(--accent); margin: 0; }
+
 /* ---------------- page navigation (centered in the topbar) ---------------- */
 .pagenav {
   flex: 0 0 auto;
@@ -327,3 +355,25 @@ button.mini {
   box-shadow: 0 4px 18px rgba(0,0,0,.5);
 }
 #toast.err { background: #3a1515; color: #fca5a5; border-color: #7a2f2f; }
+
+/* ---------------- reverse-search context menu ---------------- */
+#ctx-menu {
+  position: fixed;
+  z-index: 50;
+  min-width: 220px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(0,0,0,.55);
+  padding: 5px;
+}
+.ctx-item {
+  padding: 9px 12px;
+  border-radius: 7px;
+  font-size: 13.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-item:hover { background: var(--accent); color: #fff; }
+.ctx-item.disabled { opacity: .45; cursor: default; }
+.ctx-item.disabled:hover { background: transparent; color: inherit; }

@@ -18,16 +18,24 @@
 %      handles long questions and inline math, and never uses \resizebox or
 %      tcolorbox's fragile title machinery.
 %    * The [id] matching uses expl3 (no \forcsvlist / \ifstrequal pitfalls).
-%    * The body is collected with environ's \NewEnviron, which correctly
-%      collects the body even when the environment sits inside an
-%      \input/\include sub-file (xparse's +b overflows "text input levels").
+%    * The body is read LAZILY (NOT captured with environ's \NewEnviron or
+%      xparse's +b).  Eager capture froze `&' at catcode 4 and broke nested
+%      tikz-cd.  Lazy reading keeps tikz-cd's standard `&' syntax working AND
+%      still works inside \input/\include sub-files.
+%    * The show/hide switches work by choosing, in the begin-code, whether to
+%      open the box or swallow the body into a throw-away \vbox (see below).
+%
+%  tikz-cd: standard syntax is fully supported inside a readingnote:
+%      \begin{tikzcd}
+%        A \arrow[r] & B
+%      \end{tikzcd}
+%  (aligned / align / tabular also keep working, since their `&' stays catcode 4.)
 % ==============================================================================
 \NeedsTeXFormat{LaTeX2e}
 \ProvidesPackage{readingnote}[2026/08/15 v1 reading-note box]
 
 \RequirePackage{xcolor}
 \RequirePackage{xparse}
-\RequirePackage{environ}
 \RequirePackage{tcolorbox}
 \tcbuselibrary{breakable, skins}
 
@@ -80,17 +88,37 @@
 
 % ----------------------------------------------------------------------------
 % The environment: readingnote[id]{title}
-% (defined inside \ExplSyntaxOn so the :/_ in \rn_if_shown:nTF tokenise right)
+% ----------------------------------------------------------------------------
+% IMPORTANT: the body is read LAZILY (not captured with environ's \NewEnviron or
+% xparse's +b).  Eager body capture freezes the catcode of `&' at 4, so a nested
+% tikzcd can no longer make `&' active and `\begin{tikzcd} ... & ... \end{tikzcd}`
+% fails with "Single ampersand used with wrong catcode".
+%
+% Reading the body lazily keeps tikz-cd's own \begin code in charge of `&'
+% (standard syntax works), while aligned/align/tabular -- whose `&' stays at
+% catcode 4 -- keep working unchanged.
+%
+% The show/hide switches (\noteson / \notesoff / \shownotes{}) are implemented by
+% choosing, in the begin-code, whether to open the box or to swallow the body into
+% a throw-away \vbox (\setbox + \bgroup).  The matching end-code is stored in
+% \rn_end_cmd.  No body capture is involved, so `&' is never frozen.
+%
+% (hidden branch reads the body lazily instead of skipping it, so a note body is
+%  still tokenised/executed even when hidden; but it keeps tikz-cd `&' working.)
 % ----------------------------------------------------------------------------
 \ExplSyntaxOn
-\NewEnviron{readingnote}[2][]{%
+\NewDocumentEnvironment{readingnote}{ O{} m }{%
   \rn_if_shown:nTF {#1} {%
+    \cs_set:Npn \rn_end_cmd { \end{rnbox} }%
     \begin{rnbox}%
       {\bfseries\sffamily\color{blue!50!black}#2\par}%
       \smallskip
-      \BODY
-    \end{rnbox}%
-  }{}%
+  }{%
+    \cs_set:Npn \rn_end_cmd { \egroup }%
+    \setbox\z@\vbox\bgroup
+  }%
+}{%
+  \rn_end_cmd
 }
 \ExplSyntaxOff
 

@@ -16,7 +16,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 
 const execFileP = promisify(execFile);
@@ -221,6 +221,23 @@ function ensureReadingnotePackage(lines) {
   return { lines: newLines, added: true };
 }
 
+/* Insert \usepackage[UTF8]{ctex} into the preamble when missing (for Chinese). */
+function ensureChineseSupport(lines) {
+  for (const l of lines) {
+    if (/\\usepackage(\[[^\]]*\])?\{ctex\}/.test(l) || /\\usepackage\{xeCJK\}/.test(l) || /ctexart/.test(l)) {
+      return { lines, added: false };
+    }
+  }
+  let insertAt = 0;
+  for (let i = 0; i < lines.length; i++) if (/^\s*\\usepackage\b/.test(lines[i])) insertAt = i + 1;
+  if (insertAt === 0) {
+    for (let i = 0; i < lines.length; i++) if (/^\s*\\documentclass\b/.test(lines[i])) { insertAt = i + 1; break; }
+  }
+  for (let i = 0; i < lines.length; i++) if (/^\s*\\begin\{document\}/.test(lines[i]) && insertAt > i) insertAt = i;
+  const newLines = lines.slice(0, insertAt).concat(['\\usepackage[UTF8]{ctex}'], lines.slice(insertAt));
+  return { lines: newLines, added: true };
+}
+
 /* The blank-line-delimited paragraph(s) around a 1-based line (small, cache-friendly context). */
 function paragraphContext(lines, line1) {
   const n = lines.length;
@@ -294,6 +311,7 @@ async function synctexEdit(page, x, y) {
   try {
     const { stdout } = await execFileP('synctex', args, { cwd: active.dir, windowsHide: true, timeout: 30000 });
     const m = stdout.match(/Line:(\d+)/);
+    const cm = stdout.match(/Column:(\d+)/);
     const im = stdout.match(/Input:([^\r\n]+)/);
     let input = null;
     if (im) {
@@ -302,7 +320,7 @@ async function synctexEdit(page, x, y) {
       if (!path.isAbsolute(p)) p = path.resolve(active.dir, p);
       input = path.normalize(p);
     }
-    return { line: m ? parseInt(m[1], 10) : null, input, raw: stdout };
+    return { line: m ? parseInt(m[1], 10) : null, col: cm ? parseInt(cm[1], 10) : null, input, raw: stdout };
   } catch (e) {
     return { line: null, input: null, error: String((e && (e.stderr || e.message)) || e) };
   }
@@ -314,6 +332,42 @@ async function synctexForward(line) {
     const m = stdout.match(/Page:(\d+)/);
     return m ? parseInt(m[1], 10) : null;
   } catch (_) { return null; }
+}
+
+/* ------------------------------------------- reverse search -> editor -- */
+/*
+ * WinEdt is a single-instance app driven by a macro passed on the command line.
+ * The inverse-search invocation documented by WinEdt itself (PDFSync.pdf) is:
+ *     "WinEdt.exe" "[Open(|%f|);SelPar(%l,8);]"
+ * i.e. one bracketed macro argument, `|` as the string delimiter (a Windows
+ * filename can never contain `|`), and SelPar(line, column).  We spawn it
+ * detached with stdio ignored — never await it, because when WinEdt is not yet
+ * running it stays alive and would otherwise hang the request.
+ */
+const WINEDT_CANDIDATES = [
+  'C:\\Program Files\\WinEdt Team\\WinEdt 11\\WinEdt.exe',
+  'C:\\Program Files\\WinEdt Team\\WinEdt 10\\WinEdt.exe',
+  'C:\\Program Files (x86)\\WinEdt Team\\WinEdt 11\\WinEdt.exe',
+  'C:\\Program Files\\WinEdt Team\\WinEdt\\WinEdt.exe',
+  'C:\\Program Files (x86)\\WinEdt Team\\WinEdt\\WinEdt.exe'
+];
+function findWinEdt() {
+  if (config.winedtPath && fs.existsSync(config.winedtPath)) return config.winedtPath;
+  for (const c of WINEDT_CANDIDATES) if (fs.existsSync(c)) return c;
+  return null;
+}
+function openInWinEdt(file, line, col) {
+  const exe = findWinEdt();
+  if (!exe) return { ok: false, error: 'WinEdt.exe not found — set "winedtPath" in config.json' };
+  const macro = `[Open(|${file}|);SelPar(${line},${col || 8});]`;
+  try {
+    const child = spawn(exe, [macro], { stdio: 'ignore', windowsHide: true });
+    child.on('error', () => {});
+    child.unref();
+    return { ok: true, exe, macro };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
 }
 
 /* ------------------------------------------------------------ insertion -- */
@@ -351,24 +405,76 @@ function insertionIndex(lines, line1) {
   return Math.min(end + 1, docEnd);
 }
 
-/* ------------------------------------------------------------ llm -- */
-const SYSTEM_PROMPT =
-  'You are an expert research mathematician helping the reader annotate a mathematics paper ' +
-  'with study notes. Each note has (1) a SHORT question title and (2) a self-contained English ' +
-  'explanation body. Write rigorously in the paper\'s notation, matching the existing notes: ' +
-  '\\textbf{...} sub-headers, \\begin{itemize}/\\begin{enumerate}, $...$ inline math, \\[...\\] or ' +
-  '\\begin{aligned} display math. Reference earlier notes by id (e.g. "by Q3"). ' +
-  'Do not invent theorem/page numbers or citations. ' +
-  'Never emit raw \\input, \\include, \\includegraphics, \\bibliography, \\documentclass or \\usepackage ' +
-  'commands in the note body.\n' +
-  'ALWAYS write the TITLE and the BODY in English, even if the reader\'s query is in another language.\n\n' +
-  'OUTPUT FORMAT (strict):\n' +
-  'TITLE: <one concise question; English; plain text with only simple $..$ math; no line breaks; at most ~90 characters>\n' +
-  'BODY:\n<the LaTeX note body>';
+/* Replace the body of an existing readingnote block in a file (by id). */
+function updateNoteInFile(fp, id, title, body) {
+  if (!fs.existsSync(fp)) return false;
+  const meta = readTexFile(fp);
+  const lines = meta.lines;
+  let start = -1, end = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (start < 0 && lines[i].indexOf('\\begin{readingnote}[' + id + ']') >= 0) start = i;
+    if (start >= 0 && /^\s*\\end\{readingnote\}/.test(lines[i])) { end = i; break; }
+  }
+  if (start < 0 || end < 0) return false;
+  const newLines = lines.slice(0, start)
+    .concat(['\\begin{readingnote}[' + id + ']{' + title + '}'])
+    .concat(body.split(/\r?\n/))
+    .concat(['\\end{readingnote}'])
+    .concat(lines.slice(end + 1));
+  writeTexFile(fp, newLines, meta);
+  return true;
+}
 
-function historyBlock(entries) {
-  if (!entries.length) return '(no previous notes yet)';
-  return entries.map((e) => `[${e.id}] ${e.title}\n${e.body}`).join('\n\n---\n\n');
+/* Read the current readingnote display switch from the main tex. */
+function readNotesDisplay(meta) {
+  let mode = 'all', ids = [];
+  for (const l of meta.lines) {
+    const t = l.trim();
+    if (t.startsWith('%')) continue;
+    if (/^\\noteson\b/.test(t)) { mode = 'all'; ids = []; }
+    else if (/^\\notesoff\b/.test(t)) { mode = 'off'; ids = []; }
+    else { const m = t.match(/^\\shownotes\{([^}]*)\}/); if (m) { mode = 'some'; ids = m[1].split(',').map((s) => s.trim()).filter(Boolean); } }
+  }
+  return { mode, ids };
+}
+
+/* Replace the display switch in the main tex (before \begin{document}). */
+function setNotesDisplay(lines, mode, ids) {
+  const filtered = lines.filter((l) => {
+    const t = l.trim();
+    if (t.startsWith('%')) return true;
+    return !/^\\(noteson|notesoff|shownotes)\b/.test(t);
+  });
+  let cmd = '\\noteson';
+  if (mode === 'off') cmd = '\\notesoff';
+  else if (mode === 'some') cmd = '\\shownotes{' + (ids || []).join(',') + '}';
+  let idx = filtered.findIndex((l) => /^\s*\\begin\{document\}/.test(l));
+  if (idx < 0) idx = filtered.length;
+  filtered.splice(idx, 0, cmd);
+  return filtered;
+}
+
+/* ------------------------------------------------------------ llm -- */
+function systemPrompt(lang) {
+  const L = lang === 'zh' ? 'Chinese (中文)' : 'English';
+  return 'You are an expert research mathematician helping the reader annotate a mathematics paper ' +
+    'with study notes. Each note has (1) a SHORT question title and (2) a self-contained ' + L + ' ' +
+    'explanation body. Write rigorously in the paper\'s notation, matching the existing notes: ' +
+    '\\textbf{...} sub-headers, \\begin{itemize}/\\begin{enumerate}, $...$ inline math, \\[...\\] or ' +
+    '\\begin{aligned} display math. Reference earlier notes by id (e.g. "by Q3"). ' +
+    'Do not invent theorem/page numbers or citations. ' +
+    'Never emit raw \\input, \\include, \\includegraphics, \\bibliography, \\documentclass or \\usepackage ' +
+    'commands in the note body.\n' +
+    'ALWAYS write the TITLE and the BODY in ' + L + ', even if the reader\'s query is in another language.\n\n' +
+    'OUTPUT FORMAT (strict):\n' +
+    'TITLE: <one concise question; ' + L + '; plain text with only simple $..$ math; no line breaks; at most ~90 characters>\n' +
+    'BODY:\n<the LaTeX note body>';
+}
+
+function historyBlock(entries, excludeId) {
+  const list = excludeId ? entries.filter((e) => e.id !== excludeId) : entries;
+  if (!list.length) return '(no previous notes yet)';
+  return list.map((e) => `[${e.id}] ${e.title}\n${e.body}`).join('\n\n---\n\n');
 }
 
 function fallbackTitle(q) {
@@ -404,12 +510,12 @@ function parseTitleBody(raw, fallbackQ) {
   return { title: fallbackTitle(fallbackQ), body: r.trim() };
 }
 
-async function explain({ question, selectedText, context, thinking }) {
+async function explain({ question, selectedText, context, thinking, excludeId, lang }) {
   const apiKey = readApiKey();
   if (!apiKey) return { error: 'DEEPSEEK_API_KEY not found (set env or ~/.dsh/.credentials.yaml)' };
 
   const nb = loadNotebook();
-  const hist = historyBlock(nb.entries);
+  const hist = historyBlock(nb.entries, excludeId);
   const dm = ensureDocMeta() || {};
   const docBlock =
     (dm.title ? 'Title: ' + dm.title + '\n' : '') +
@@ -434,7 +540,7 @@ async function explain({ question, selectedText, context, thinking }) {
     const body = {
       model: llmModel(),
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: systemPrompt(lang) },
         { role: 'user', content: user }
       ],
       stream: false,
@@ -554,6 +660,7 @@ function stateForActive() {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   const p = url.pathname;
+  console.log(`[req] ${new Date().toISOString()} ${req.method} ${p}`);
 
   try {
     if (p === '/' || p === '/index.html') return serveStatic(req, res, path.join(PUBLIC, 'index.html'));
@@ -684,6 +791,43 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: r.ok, logTail: r.out.slice(-4000), nextQ: st.nextQ });
     }
 
+    if (p === '/api/synctex-jump' && req.method === 'POST') {
+      // reverse search: PDF point -> .tex file/line -> jump WinEdt to it
+      if (!active) return sendJSON(res, 400, { error: 'no active notebook' });
+      const b = await readBody(req);
+      const page = Number(b.page), x = Number(b.x), y = Number(b.y);
+      if (!Number.isFinite(page) || !Number.isFinite(x) || !Number.isFinite(y)) {
+        return sendJSON(res, 400, { error: 'invalid page/x/y' });
+      }
+      const st = await synctexEdit(page, x, y);
+      if (st.line == null) return sendJSON(res, 400, { error: 'synctex mapping failed: ' + (st.error || st.raw || 'no line') });
+      const targetFile = (st.input && fs.existsSync(st.input)) ? path.normalize(st.input) : texPath();
+      const col = st.col || 8;
+      const r = openInWinEdt(targetFile, st.line, col);
+      if (!r.ok) return sendJSON(res, 400, { error: r.error });
+      return sendJSON(res, 200, { ok: true, file: targetFile, line: st.line, col });
+    }
+
+    if (p === '/api/notes-display' && req.method === 'GET') {
+      if (!active) return sendJSON(res, 400, { error: 'no active notebook' });
+      const meta = readTex();
+      const d = readNotesDisplay(meta);
+      const nb = loadNotebook();
+      return sendJSON(res, 200, { mode: d.mode, ids: d.ids, allIds: nb.entries.map((e) => e.id) });
+    }
+
+    if (p === '/api/notes-display' && req.method === 'POST') {
+      if (!active) return sendJSON(res, 400, { error: 'no active notebook' });
+      const b = await readBody(req);
+      const mode = String(b.mode || 'all');
+      const ids = Array.isArray(b.ids) ? b.ids.map((s) => String(s).trim()).filter(Boolean) : [];
+      const meta = readTex();
+      const lines = setNotesDisplay(meta.lines, mode, ids);
+      writeTex(lines, meta);
+      const compiled = await compile();
+      return sendJSON(res, 200, { ok: compiled.ok, mode, ids, logTail: compiled.out.slice(-4000) });
+    }
+
     if (p === '/api/explain' && req.method === 'POST') {
       if (!active) return sendJSON(res, 400, { error: 'no active notebook' });
       const b = await readBody(req);
@@ -699,7 +843,8 @@ const server = http.createServer(async (req, res) => {
       const r = await explain({
         question: String(b.question || '').slice(0, 2000),
         selectedText: String(b.selectedText || '').slice(0, 4000),
-        context, thinking: !!b.thinking
+        context, thinking: !!b.thinking,
+        lang: b.lang === 'zh' ? 'zh' : 'en'
       });
       if (r.error) return sendJSON(res, 502, r);
       return sendJSON(res, 200, Object.assign({ line, historyCount: loadNotebook().entries.length }, r));
@@ -779,6 +924,7 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const thinking = !!b.thinking;
       const writeToTex = b.writeToTex !== false;
+      const lang = b.lang === 'zh' ? 'zh' : 'en';
       const question = String(b.question || '').trim();
       const selectedText = String(b.selectedText || '').slice(0, 4000);
       const page = Number(b.page), x = Number(b.x), y = Number(b.y);
@@ -795,7 +941,7 @@ const server = http.createServer(async (req, res) => {
         context = paragraphContext(readTexFile(ctxFile).lines, st.line);
       }
 
-      const r = await explain({ question, selectedText, context, thinking });
+      const r = await explain({ question, selectedText, context, thinking, lang });
       if (r.error) return sendJSON(res, 502, r);
 
       const nb = loadNotebook();
@@ -814,15 +960,22 @@ const server = http.createServer(async (req, res) => {
         if (st.input && fs.existsSync(st.input)) targetFile = path.normalize(st.input);
         const isMain = sameFile(targetFile, texPath());
 
-        // 1) \usepackage{readingnote} goes ONLY in the main (compiled) file
+        // 1) \usepackage{readingnote} (and ctex if Chinese) go ONLY in the main file
         const mainMeta = readTex();
-        const mainPkg = ensureReadingnotePackage(mainMeta.lines);
-        if (mainPkg.added) writeTex(mainPkg.lines, mainMeta);
+        let mainLines = mainMeta.lines;
+        let mainShift = 0;
+        const mainPkg = ensureReadingnotePackage(mainLines);
+        if (mainPkg.added) { mainLines = mainPkg.lines; mainShift++; }
+        if (lang === 'zh') {
+          const zh = ensureChineseSupport(mainLines);
+          if (zh.added) { mainLines = zh.lines; mainShift++; }
+        }
+        if (mainShift) writeTex(mainLines, mainMeta);
 
         // 2) insert the note into the file that actually contains the text
         const tMeta = readTexFile(targetFile);
         const lines = tMeta.lines;
-        const effLine = st.line + (isMain && mainPkg.added ? 1 : 0);
+        const effLine = st.line + (isMain ? mainShift : 0);
         const inside = readingnoteContaining(lines, effLine);
         const idx = inside ? inside.end : insertionIndex(lines, effLine);
         const block = ['\\begin{readingnote}[' + qid + ']{' + title + '}']
@@ -851,6 +1004,83 @@ const server = http.createServer(async (req, res) => {
         nextQ: maxQ(nb.entries, writeToTex ? readTex().lines : meta.lines) + 1,
         historyCount: nb.entries.length
       });
+    }
+
+    if (p === '/api/reanswer' && req.method === 'POST') {
+      if (!active) return sendJSON(res, 400, { error: 'no active notebook' });
+      const b = await readBody(req);
+      const id = String(b.id || '').trim();
+      const thinking = !!b.thinking;
+      const nb = loadNotebook();
+      const entry = nb.entries.find((e) => e.id === id);
+      if (!entry) return sendJSON(res, 404, { error: 'note not found: ' + id });
+
+      // locate context: page/x/y via synctex, fallback to line in main file
+      let context = '';
+      if (entry.page != null && entry.x != null && entry.y != null) {
+        const st = await synctexEdit(entry.page, entry.x, entry.y);
+        if (st.line != null) {
+          const f = (st.input && fs.existsSync(st.input)) ? path.normalize(st.input) : texPath();
+          context = paragraphContext(readTexFile(f).lines, st.line);
+        }
+      }
+      if (!context && entry.line) {
+        context = paragraphContext(readTex().lines, entry.line);
+      }
+
+      const r = await explain({ question: entry.title, selectedText: '', context, thinking, excludeId: id, lang: b.lang === 'zh' ? 'zh' : 'en' });
+      if (r.error) return sendJSON(res, 502, r);
+      return sendJSON(res, 200, r);
+    }
+
+    if (p === '/api/update-note' && req.method === 'POST') {
+      if (!active) return sendJSON(res, 400, { error: 'no active notebook' });
+      const b = await readBody(req);
+      const id = String(b.id || '').trim();
+      const title = String(b.title || '').replace(/\s*\r?\n\s*/g, ' ').trim();
+      let explanation = String(b.explanation || '').trim();
+      if (!title || !explanation) return sendJSON(res, 400, { error: 'title and explanation are required' });
+
+      const nb = loadNotebook();
+      const entry = nb.entries.find((e) => e.id === id);
+      if (!entry) return sendJSON(res, 404, { error: 'note not found: ' + id });
+
+      const lang = b.lang === 'zh' ? 'zh' : 'en';
+      explanation = sanitizeExplanation(explanation
+        .replace(/^\s*\\begin\{readingnote\}(?:\[[^\]]*\])?(?:\{[^}]*\})?\s*/i, '')
+        .replace(/\s*\\end\{readingnote\}\s*$/i, ''));
+
+      entry.title = title;
+      entry.body = explanation;
+      entry.ts = new Date().toISOString();
+
+      const writeToTex = b.writeToTex !== false && entry.inTex;
+      let ok = true, logTail = '', recompiled = false;
+      if (writeToTex) {
+        // ensure Chinese support in the main file before writing a Chinese body
+        if (lang === 'zh') {
+          const m = readTex();
+          const zh = ensureChineseSupport(m.lines);
+          if (zh.added) writeTex(zh.lines, m);
+        }
+        // update in the main file first, else search other top-level .tex files
+        const mainOk = updateNoteInFile(texPath(), id, title, explanation);
+        if (!mainOk) {
+          for (const f of listTexFiles(active.dir)) {
+            const fp = path.join(active.dir, f);
+            if (sameFile(fp, texPath())) continue;
+            if (updateNoteInFile(fp, id, title, explanation)) break;
+          }
+        }
+        const compiled = await compile();
+        ok = compiled.ok;
+        logTail = compiled.out.slice(-4000);
+        recompiled = true;
+      } else {
+        logTail = '(saved to notebook only)';
+      }
+      saveNotebook(nb);
+      return sendJSON(res, 200, { ok, recompiled, logTail });
     }
 
     res.writeHead(404, { 'content-type': 'text/plain' });
